@@ -1,0 +1,7 @@
+return () => {
+            Object.values(peersRef.current).forEach((p) => p.destroy());
+            socket.off("signal");
+            startedRef.current = false;
+        };
+    }
+}, [roomId, name]);
