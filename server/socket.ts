@@ -24,10 +24,18 @@ export function initSocket(server: any) {
 
         // 🔴 IMPORTANT — WebRTC signaling exchange
         socket.on("signal", ({ to, signal }) => {
+            // Find the user's name to send with the signal
+            const user = Object.values(rooms).flat().find(u => u.id === socket.id);
             io.to(to).emit("signal", {
                 from: socket.id,
                 signal,
+                userName: user?.name || "Unknown"
             });
+        });
+
+        // Chat message handling
+        socket.on("chat-message", ({ roomId, message }) => {
+            io.to(roomId).emit("chat-message", message);
         });
 
         // user leaves
