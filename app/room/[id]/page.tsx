@@ -97,7 +97,94 @@ export default function RoomPage() {
 
     const isTranslateMode = language !== null;
 
-    // ---------------- speaking detection ----------------
+    // ---------------- remote translation ----------------
+    function startRemoteTranslation(remoteStream: MediaStream, userName: string) {
+        console.log("Starting remote translation for:", userName);
+        
+        const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+        if (!SpeechRecognition) {
+            console.warn("Speech recognition not supported");
+            return;
+        }
+
+        // Create audio context to process remote audio
+        const audioContext = new AudioContext();
+        const source = audioContext.createMediaStreamSource(remoteStream);
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 512;
+        source.connect(analyser);
+
+        // Create a destination for the audio to be processed
+        const destination = audioContext.createMediaStreamDestination();
+        source.connect(destination);
+
+        const recognition = new SpeechRecognition();
+        recognition.continuous = true;
+        recognition.interimResults = true;
+        recognition.lang = "en-US";
+
+        recognition.onresult = async (event: any) => {
+            let text = "";
+            let isFinal = false;
+
+            for (let i = event.resultIndex; i < event.results.length; i++) {
+                text += event.results[i][0].transcript;
+                if (event.results[i].isFinal) {
+                    isFinal = true;
+                }
+            }
+
+            if (isFinal && text.length > 10) {
+                console.log(`Remote speech detected from ${userName}:`, text);
+                
+                const detected = await detectLanguage(text);
+                console.log(`Detected language for ${userName}:`, detected);
+
+                if (detected !== recognition.lang) {
+                    recognition.lang = detected === "hi" ? "hi-IN" :
+                        detected === "ta" ? "ta-IN" :
+                            detected === "kn" ? "kn-IN" : "en-US";
+                }
+
+                // Translate and speak the remote user's speech
+                if (language && detected !== language) {
+                    try {
+                        const res = await fetch("/api/translate", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ text, targetLang: language }),
+                        });
+                        const data = await res.json();
+                        
+                        if (data.translatedText) {
+                            console.log(`Translation for ${userName}:`, data.translatedText);
+                            speakTranslatedText(data.translatedText, language);
+                            
+                            // Update translation panel to show remote user's speech
+                            setTranscript(`${userName}: ${text}`);
+                            setTranslated(data.translatedText);
+                            setDetectedLanguage(detected);
+                        }
+                    } catch (error) {
+                        console.error("Translation error for remote user:", error);
+                    }
+                }
+            }
+        };
+
+        recognition.onerror = (event: any) => {
+            console.error("Remote speech recognition error:", event.error);
+        };
+
+        recognition.start();
+        console.log("Remote translation started for:", userName);
+
+        // Store recognition instance for cleanup
+        if (!recognitionRef.current) {
+            recognitionRef.current = {};
+        }
+        recognitionRef.current[userName] = recognition;
+    }
     function startSpeakingDetection(stream: MediaStream) {
         const ctx = new AudioContext();
         const src = ctx.createMediaStreamSource(stream);
@@ -109,10 +196,12 @@ export default function RoomPage() {
 
         function detect() {
             analyser.getByteFrequencyData(data);
-            const volume = data.reduce((a, b) => a + b, 0) / data.length;
-            setSpeaking(volume > 10);
+            const average = data.reduce((a, b) => a + b) / data.length;
+            const isSpeaking = average > 10;
+            setSpeaking(isSpeaking);
             requestAnimationFrame(detect);
         }
+
         detect();
     }
 
@@ -263,6 +352,12 @@ export default function RoomPage() {
                 console.log("Updating existing video frame for:", userId);
                 return prev.map(f => f.id === userId ? { ...f, stream: remoteStream } : f);
             });
+
+            // Start speech recognition for remote user's audio if translation is enabled
+            if (isTranslateMode && remoteStream.getAudioTracks().length > 0) {
+                console.log("Starting translation for remote user:", userId, userName);
+                startRemoteTranslation(remoteStream, userName);
+            }
 
             // Set the first remote stream to the video element as fallback
             const videoElements = document.querySelectorAll(`[data-peer-video="${userId}"]`);
