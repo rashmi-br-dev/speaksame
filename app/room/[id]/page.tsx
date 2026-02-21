@@ -303,7 +303,21 @@ export default function RoomPage() {
 
             if (localVideoRef.current) {
                 localVideoRef.current.srcObject = stream;
-                localVideoRef.current.play().catch(err => console.warn("Local video play error:", err));
+                // Enhanced video playback with autoplay fix
+                localVideoRef.current.play().catch(err => {
+                    console.warn("Local video play error:", err);
+                    // Try muted first, then unmute to bypass autoplay restrictions
+                    if (localVideoRef.current) {
+                        localVideoRef.current.muted = true;
+                        localVideoRef.current.play().then(() => {
+                            if (localVideoRef.current) {
+                                localVideoRef.current.muted = false;
+                            }
+                        }).catch(unmuteErr => {
+                            console.warn("Video unmute error:", unmuteErr);
+                        });
+                    }
+                });
             }
 
             startSpeakingDetection(stream);
@@ -614,8 +628,25 @@ export default function RoomPage() {
                                                     data-peer-video={frame.id}
                                                     ref={(el) => {
                                                         if (el && frame.stream) {
+                                                            console.log("Setting video stream for", frame.name, frame.stream);
                                                             el.srcObject = frame.stream;
-                                                            el.play().catch(err => console.warn("Video play error:", err));
+                                                            // Force video to play
+                                                            el.play().then(() => {
+                                                                console.log("Video playing successfully for", frame.name);
+                                                            }).catch(err => {
+                                                                console.warn("Remote video play error:", err);
+                                                                // Try muted first, then unmute to bypass autoplay restrictions
+                                                                if (el) {
+                                                                    el.muted = true;
+                                                                    el.play().then(() => {
+                                                                        if (el) {
+                                                                            el.muted = false;
+                                                                        }
+                                                                    }).catch(unmuteErr => {
+                                                                        console.warn("Remote video unmute error:", unmuteErr);
+                                                                    });
+                                                                }
+                                                            });
                                                         }
                                                     }}
                                                 />
@@ -674,6 +705,28 @@ export default function RoomPage() {
                                                     playsInline
                                                     muted
                                                     className="w-full h-full object-cover"
+                                                    onLoad={() => {
+                                                        console.log("Speaker view video loaded, attempting to play");
+                                                        // Enhanced video playback fix on load
+                                                        if (localVideoRef.current) {
+                                                            localVideoRef.current.play().then(() => {
+                                                                console.log("Speaker view video playing successfully");
+                                                            }).catch(err => {
+                                                                console.warn("Speaker view video play error:", err);
+                                                                // Try muted first, then unmute
+                                                                if (localVideoRef.current) {
+                                                                    localVideoRef.current.muted = true;
+                                                                    localVideoRef.current.play().then(() => {
+                                                                        if (localVideoRef.current) {
+                                                                            localVideoRef.current.muted = false;
+                                                                        }
+                                                                    }).catch(unmuteErr => {
+                                                                        console.warn("Speaker view video unmute error:", unmuteErr);
+                                                                    });
+                                                                }
+                                                            });
+                                                        }
+                                                    }}
                                                 />
                                                 {isVideoOff && (
                                                     <div className="absolute inset-0 flex items-center justify-center bg-gray-900">
