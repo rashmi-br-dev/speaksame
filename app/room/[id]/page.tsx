@@ -93,6 +93,7 @@ export default function RoomPage() {
     const [videoFrames, setVideoFrames] = useState<VideoFrame[]>([]);
     const [layoutMode, setLayoutMode] = useState<"grid" | "speaker" | "gallery">("grid");
     const [copiedRoomId, setCopiedRoomId] = useState(false);
+    const [copiedInviteLink, setCopiedInviteLink] = useState(false);
 
     const isTranslateMode = language !== null;
 
@@ -157,17 +158,24 @@ export default function RoomPage() {
         setTimeout(() => setCopiedRoomId(false), 2000);
     }
 
+    function copyInviteLink() {
+        const inviteLink = `${typeof window !== 'undefined' ? window.location.origin : ''}/room/${roomId}?name=Guest`;
+        navigator.clipboard.writeText(inviteLink);
+        setCopiedInviteLink(true);
+        setTimeout(() => setCopiedInviteLink(false), 2000);
+    }
+
     function sendMessage() {
         if (newMessage.trim()) {
             const message: Message = {
-                id: Date.now().toString(),
+                id: `${socket.id}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`, // More unique ID
                 user: name,
                 text: newMessage.trim(),
                 timestamp: new Date()
             };
 
             socket.emit("chat-message", { roomId, message });
-            setMessages(prev => [...prev, message]);
+            // Don't add to local state - let the socket handle it to avoid duplicates
             setNewMessage("");
         }
     }
@@ -186,7 +194,13 @@ export default function RoomPage() {
 
     // ---------------- peer ----------------
     function createPeer(userId: string, initiator: boolean, stream: MediaStream, userName: string) {
+        console.log("=== CREATING PEER ===");
+        console.log("Target user:", userId, userName);
+        console.log("Am I initiator:", initiator);
+        console.log("Stream tracks:", stream.getTracks().length);
+        
         if (peersRef.current[userId]) {
+            console.log("Peer already exists for", userId, "destroying old one");
             peersRef.current[userId].destroy();
         }
 
@@ -209,18 +223,25 @@ export default function RoomPage() {
         });
 
         peer.on("signal", (signal) => {
+            console.log("Sending signal to:", userId);
             socket.emit("signal", { to: userId, signal });
         });
 
         peer.on("stream", async (remoteStream) => {
-            console.log("Received remote stream from", userId, remoteStream);
+            console.log("=== RECEIVED REMOTE STREAM ===");
+            console.log("From user:", userId, userName);
+            console.log("Remote tracks:", remoteStream.getTracks().length);
+            console.log("Video tracks:", remoteStream.getVideoTracks().length);
+            console.log("Audio tracks:", remoteStream.getAudioTracks().length);
 
             // Add to remote peers
             setRemotePeers(prev => {
                 const existing = prev.find(p => p.id === userId);
                 if (existing) {
+                    console.log("Updating existing peer stream for:", userId);
                     return prev.map(p => p.id === userId ? { ...p, stream: remoteStream } : p);
                 } else {
+                    console.log("Adding new peer stream for:", userId, userName);
                     return [...prev, { id: userId, name: userName, stream: remoteStream }];
                 }
             });
@@ -229,6 +250,7 @@ export default function RoomPage() {
             setVideoFrames(prev => {
                 const existing = prev.find(f => f.id === userId);
                 if (!existing) {
+                    console.log("Creating new video frame for:", userId, userName);
                     return [...prev, {
                         id: userId,
                         name: userName,
@@ -238,11 +260,13 @@ export default function RoomPage() {
                         position: { x: 0, y: 0 }
                     }];
                 }
+                console.log("Updating existing video frame for:", userId);
                 return prev.map(f => f.id === userId ? { ...f, stream: remoteStream } : f);
             });
 
             // Set the first remote stream to the video element as fallback
             const videoElements = document.querySelectorAll(`[data-peer-video="${userId}"]`);
+            console.log("Found video elements for", userId, ":", videoElements.length);
             for (const el of videoElements) {
                 const videoEl = el as HTMLVideoElement;
                 if (videoEl.srcObject !== remoteStream) {
@@ -258,23 +282,33 @@ export default function RoomPage() {
         });
 
         peer.on("connect", () => {
+            console.log("=== PEER CONNECTED ===");
+            console.log("Successfully connected to user:", userId, userName);
             const pc = (peer as any)._pc as RTCPeerConnection;
             const sender = pc.getSenders().find((s) => s.track?.kind === "audio");
             if (sender) sendersRef.current[userId] = sender;
         });
 
         peer.on("error", (error) => {
-            console.error("Peer connection error for user", userId, ":", error);
-            delete peersRef.current[userId];
-            delete sendersRef.current[userId];
-            setRemotePeers(prev => prev.filter(p => p.id !== userId));
-            setVideoFrames(prev => prev.filter(f => f.id !== userId));
-
-            setTimeout(() => {
-                if (streamRef.current) {
-                    createPeer(userId, false, streamRef.current, userName);
-                }
-            }, 2000);
+            console.warn("Peer connection error for user", userId, ":", error.message);
+            // Don't immediately delete peer on abort errors - these are normal
+            if (error.message.includes("User-Initiated Abort") || error.message.includes("Close called")) {
+                console.log("Peer connection closed normally for user:", userId);
+            } else {
+                console.error("Unexpected peer error for user", userId, ":", error);
+                delete peersRef.current[userId];
+                delete sendersRef.current[userId];
+                setRemotePeers(prev => prev.filter(p => p.id !== userId));
+                setVideoFrames(prev => prev.filter(f => f.id !== userId));
+                
+                // Attempt to reconnect after a delay
+                setTimeout(() => {
+                    if (streamRef.current && !peersRef.current[userId]) {
+                        console.log("Attempting to reconnect with user:", userId);
+                        createPeer(userId, false, streamRef.current, "Unknown");
+                    }
+                }, 3000);
+            }
         });
 
         peer.on("close", () => {
@@ -324,24 +358,36 @@ export default function RoomPage() {
             console.log("Camera and microphone active - tracks:", stream.getTracks());
 
             socket.emit("join-room", { roomId, name });
+            console.log("=== JOINING ROOM ===");
+            console.log("Room ID:", roomId);
+            console.log("My name:", name);
+            console.log("My socket ID:", socket.id);
 
             socket.on("users", (users) => {
                 const myId = socket.id;
                 if (!myId) return;
 
+                console.log("My ID:", myId);
+                console.log("Users in room:", users);
+                console.log("Current peers:", Object.keys(peersRef.current));
+                
                 users.forEach((user: any) => {
                     if (user.id === myId) return;
                     if (peersRef.current[user.id]) return;
 
+                    console.log("Creating peer for user:", user.id, user.name);
                     const initiator = myId < user.id;
+                    console.log("Am I initiator?", initiator);
                     createPeer(user.id, initiator, stream, user.name);
                 });
             });
 
             socket.on("signal", ({ from, signal, userName }) => {
+                console.log("Received signal from:", from, userName);
                 let peer = peersRef.current[from];
 
                 if (!peer) {
+                    console.log("Creating peer for signal from:", from);
                     createPeer(from, false, stream, userName);
                     peer = peersRef.current[from];
                 }
@@ -351,6 +397,7 @@ export default function RoomPage() {
                         setTimeout(() => {
                             if (peer && !peer.destroyed) {
                                 peer.signal(signal);
+                                console.log("Signal processed for:", from);
                             }
                         }, 100);
                     } catch (error) {
@@ -364,27 +411,71 @@ export default function RoomPage() {
                                 peersRef.current[from].signal(signal);
                             }
                         }, 500);
-                    }
+                }
+            }
+        });
+
+        socket.on("chat-message", (message: Message) => {
+            console.log("Received chat message:", message);
+            setMessages(prev => {
+                // Check if message with this ID already exists to prevent duplicates
+                if (prev.find(m => m.id === message.id)) {
+                    return prev;
+                }
+                const newMessages = [...prev, message];
+                // Keep only last 50 messages to prevent memory issues
+                if (newMessages.length > 50) {
+                    return newMessages.slice(-50);
+                }
+                return newMessages;
+            });
+        });
+    }
+
+    init();
+
+    return () => {
+        Object.values(peersRef.current).forEach((p) => p.destroy());
+    };
+
+    socket.on("chat-message", (message: Message) => {
+        console.log("Received chat message:", message);
+        setMessages(prev => {
+            const newMessages = [...prev, message];
+            // Keep only last 50 messages to prevent memory issues
+            if (newMessages.length > 50) {
+                return newMessages.slice(-50);
+            }
+            return newMessages;
+        });
+    });
+}, [roomId, name]);
+
+    // ---------------- speaker view video fix ----------------
+    useEffect(() => {
+        if (layoutMode === "speaker" && localVideoRef.current && streamRef.current) {
+            console.log("Speaker view detected, setting video stream");
+            localVideoRef.current.srcObject = streamRef.current;
+            
+            // Force video to play
+            localVideoRef.current.play().then(() => {
+                console.log("Speaker view video playing successfully");
+            }).catch(err => {
+                console.warn("Speaker view video play error:", err);
+                // Try muted first, then unmute
+                if (localVideoRef.current) {
+                    localVideoRef.current.muted = true;
+                    localVideoRef.current.play().then(() => {
+                        if (localVideoRef.current) {
+                            localVideoRef.current.muted = false;
+                        }
+                    }).catch(unmuteErr => {
+                        console.warn("Speaker view video unmute error:", unmuteErr);
+                    });
                 }
             });
-
-            socket.on("chat-message", (message: Message) => {
-                setMessages(prev => [...prev, message]);
-            });
         }
-
-        init();
-
-        return () => {
-            Object.values(peersRef.current).forEach((p) => p.destroy());
-            socket.off("signal");
-            socket.off("chat-message");
-            socket.off("users");
-            startedRef.current = false;
-        };
-    }, [roomId, name]);
-
-    // ---------------- language detection ----------------
+    }, [layoutMode]);
     async function detectLanguage(text: string): Promise<string> {
         try {
             const response = await fetch("/api/detect-language", {
@@ -548,6 +639,24 @@ export default function RoomPage() {
                             {remotePeers.length + 1}
                         </Button>
 
+                        {/* Language Selector - MAIN FEATURE */}
+                        <div className="flex items-center gap-2">
+                            <span className="text-sm font-medium">🌍 Translate to:</span>
+                            <Select value={language || "none"} onValueChange={(v) => setLanguage(v === "none" ? null : v)}>
+                                <SelectTrigger className="w-40">
+                                    <SelectValue placeholder="Choose language" />
+                                </SelectTrigger>
+                                <SelectContent>
+                                    <SelectItem value="none">No translation</SelectItem>
+                                    <SelectItem value="en">English</SelectItem>
+                                    <SelectItem value="hi">Hindi</SelectItem>
+                                    <SelectItem value="kn">Kannada</SelectItem>
+                                    <SelectItem value="ta">Tamil</SelectItem>
+                                    <SelectItem value="es">Spanish</SelectItem>
+                                </SelectContent>
+                            </Select>
+                        </div>
+
                         {/* Theme Toggle */}
                         <ThemeToggle />
 
@@ -628,13 +737,16 @@ export default function RoomPage() {
                                                     data-peer-video={frame.id}
                                                     ref={(el) => {
                                                         if (el && frame.stream) {
-                                                            console.log("Setting video stream for", frame.name, frame.stream);
-                                                            el.srcObject = frame.stream;
+                                                            console.log("Grid view - Setting video stream for", frame.name, frame.stream);
+                                                            // Only set srcObject if it's different to prevent flickering
+                                                            if (el.srcObject !== frame.stream) {
+                                                                el.srcObject = frame.stream;
+                                                            }
                                                             // Force video to play
                                                             el.play().then(() => {
-                                                                console.log("Video playing successfully for", frame.name);
+                                                                console.log("Grid view - Video playing successfully for", frame.name);
                                                             }).catch(err => {
-                                                                console.warn("Remote video play error:", err);
+                                                                console.warn("Grid view - Remote video play error:", err);
                                                                 // Try muted first, then unmute to bypass autoplay restrictions
                                                                 if (el) {
                                                                     el.muted = true;
@@ -643,7 +755,7 @@ export default function RoomPage() {
                                                                             el.muted = false;
                                                                         }
                                                                     }).catch(unmuteErr => {
-                                                                        console.warn("Remote video unmute error:", unmuteErr);
+                                                                        console.warn("Grid view - Remote video unmute error:", unmuteErr);
                                                                     });
                                                                 }
                                                             });
@@ -705,28 +817,6 @@ export default function RoomPage() {
                                                     playsInline
                                                     muted
                                                     className="w-full h-full object-cover"
-                                                    onLoad={() => {
-                                                        console.log("Speaker view video loaded, attempting to play");
-                                                        // Enhanced video playback fix on load
-                                                        if (localVideoRef.current) {
-                                                            localVideoRef.current.play().then(() => {
-                                                                console.log("Speaker view video playing successfully");
-                                                            }).catch(err => {
-                                                                console.warn("Speaker view video play error:", err);
-                                                                // Try muted first, then unmute
-                                                                if (localVideoRef.current) {
-                                                                    localVideoRef.current.muted = true;
-                                                                    localVideoRef.current.play().then(() => {
-                                                                        if (localVideoRef.current) {
-                                                                            localVideoRef.current.muted = false;
-                                                                        }
-                                                                    }).catch(unmuteErr => {
-                                                                        console.warn("Speaker view video unmute error:", unmuteErr);
-                                                                    });
-                                                                }
-                                                            });
-                                                        }
-                                                    }}
                                                 />
                                                 {isVideoOff && (
                                                     <div className="absolute inset-0 flex items-center justify-center bg-gray-900">
@@ -773,6 +863,125 @@ export default function RoomPage() {
                                         </Card>
                                     ))}
                                 </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {layoutMode === "gallery" && (
+                        <div className="max-w-7xl mx-auto">
+                            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                                {/* Local Video */}
+                                <Card className={`relative group ${theme === 'dark' ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'}`}>
+                                    <CardContent className="p-0">
+                                        <div className="relative aspect-video bg-black rounded-lg overflow-hidden">
+                                            <video
+                                                ref={localVideoRef}
+                                                autoPlay
+                                                playsInline
+                                                muted
+                                                className="w-full h-full object-cover"
+                                            />
+                                            {isVideoOff && (
+                                                <div className="absolute inset-0 flex items-center justify-center bg-gray-900">
+                                                    <VideoOff className="w-12 h-12 text-gray-400" />
+                                                </div>
+                                            )}
+
+                                            {/* Video Controls Overlay */}
+                                            <div className="absolute top-2 left-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                                                <Badge variant="secondary" className="text-xs">
+                                                    You ({name})
+                                                </Badge>
+                                            </div>
+
+                                            <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity flex gap-1">
+                                                <Button
+                                                    size="sm"
+                                                    variant="secondary"
+                                                    className="h-6 w-6 p-0"
+                                                    onClick={() => toggleVideoFrameMinimize('local')}
+                                                >
+                                                    <Minimize2 className="w-3 h-3" />
+                                                </Button>
+                                            </div>
+                                        </div>
+                                    </CardContent>
+                                </Card>
+
+                                {/* Remote Videos */}
+                                {videoFrames.map((frame) => (
+                                    <Card key={frame.id} className={`relative group ${theme === 'dark' ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'}`}>
+                                        <CardContent className="p-0">
+                                            <div className="relative aspect-video bg-black rounded-lg overflow-hidden">
+                                                {frame.stream ? (
+                                                    <video
+                                                        autoPlay
+                                                        playsInline
+                                                        muted={false}
+                                                        className="w-full h-full object-cover"
+                                                        data-peer-video={frame.id}
+                                                        ref={(el) => {
+                                                            if (el && frame.stream) {
+                                                                console.log("Gallery view - Setting video stream for", frame.name, frame.stream);
+                                                                el.srcObject = frame.stream;
+                                                                // Force video to play
+                                                                el.play().then(() => {
+                                                                    console.log("Gallery view - Video playing successfully for", frame.name);
+                                                                }).catch(err => {
+                                                                    console.warn("Gallery view - Remote video play error:", err);
+                                                                    // Try muted first, then unmute to bypass autoplay restrictions
+                                                                    if (el) {
+                                                                        el.muted = true;
+                                                                        el.play().then(() => {
+                                                                            if (el) {
+                                                                                el.muted = false;
+                                                                            }
+                                                                        }).catch(unmuteErr => {
+                                                                            console.warn("Gallery view - Remote video unmute error:", unmuteErr);
+                                                                        });
+                                                                    }
+                                                                });
+                                                            }
+                                                        }}
+                                                    />
+                                                ) : (
+                                                    <div className="absolute inset-0 flex items-center justify-center bg-gray-900">
+                                                        <div className="text-center">
+                                                            <Video className="w-12 h-12 text-gray-400 mx-auto mb-2" />
+                                                            <p className="text-gray-400 text-sm">Connecting...</p>
+                                                        </div>
+                                                    </div>
+                                                )}
+
+                                                {/* Video Controls Overlay */}
+                                                <div className="absolute top-2 left-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                                                    <Badge variant="secondary" className="text-xs">
+                                                        {frame.name}
+                                                    </Badge>
+                                                </div>
+
+                                                <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity flex gap-1">
+                                                    <Button
+                                                        size="sm"
+                                                        variant="secondary"
+                                                        className="h-6 w-6 p-0"
+                                                        onClick={() => toggleVideoFrameMinimize(frame.id)}
+                                                    >
+                                                        {frame.isMinimized ? <Maximize2 className="w-3 h-3" /> : <Minimize2 className="w-3 h-3" />}
+                                                    </Button>
+                                                    <Button
+                                                        size="sm"
+                                                        variant="secondary"
+                                                        className="h-6 w-6 p-0"
+                                                        onClick={() => toggleVideoFrameMaximize(frame.id)}
+                                                    >
+                                                        <Maximize2 className="w-3 h-3" />
+                                                    </Button>
+                                                </div>
+                                            </div>
+                                        </CardContent>
+                                    </Card>
+                                ))}
                             </div>
                         </div>
                     )}
@@ -860,6 +1069,13 @@ export default function RoomPage() {
                                         readOnly
                                         className="flex-1 text-sm"
                                     />
+                                    <Button
+                                        onClick={copyInviteLink}
+                                        variant="outline"
+                                        size="sm"
+                                    >
+                                        {copiedInviteLink ? "Copied!" : <Copy className="w-4 h-4" />}
+                                    </Button>
                                 </div>
                             </div>
                             <div className="flex justify-end gap-2">
@@ -962,9 +1178,9 @@ export default function RoomPage() {
                                 {messages.map((message) => (
                                     <div key={message.id} className="mb-2">
                                         <div className="flex items-baseline gap-2">
-                                            <span className="font-semibold text-sm">{message.user}:</span>
+                                            <span className="font-semibold text-sm">{message.user === name ? name : message.user}:</span>
                                             <span className="text-xs text-gray-500">
-                                                {message.timestamp.toLocaleTimeString()}
+                                                {new Date(message.timestamp).toLocaleTimeString()}
                                             </span>
                                         </div>
                                         <p className="text-sm mt-1">{message.text}</p>
@@ -988,41 +1204,58 @@ export default function RoomPage() {
                 </div>
             )}
 
-            {/* Translation Panel */}
+            {/* Translation Panel - MAIN FEATURE */}
             {isTranslateMode && (
-                <Card className={`fixed bottom-24 left-6 w-80 ${theme === 'dark' ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'} shadow-xl`}>
-                    <CardHeader className="pb-2">
-                        <CardTitle className="text-sm flex items-center gap-2">
-                            <Monitor className="w-4 h-4" />
-                            Translation
+                <Card className={`fixed bottom-24 left-6 w-96 ${theme === 'dark' ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'} shadow-2xl border-2 border-blue-500`}>
+                    <CardHeader className="pb-2 bg-gradient-to-r from-blue-500 to-purple-600 text-white">
+                        <CardTitle className="text-lg flex items-center gap-2">
+                            <Monitor className="w-5 h-5" />
+                            🎤 Live Translation
                         </CardTitle>
                     </CardHeader>
-                    <CardContent className="space-y-2">
-                        <div className="space-y-2">
-                            <label className="text-sm font-medium">Listen Language</label>
-                            <Select onValueChange={(v) => setLanguage(v === "none" ? null : v)}>
-                                <SelectTrigger>
-                                    <SelectValue placeholder="No translation" />
-                                </SelectTrigger>
-                                <SelectContent>
-                                    <SelectItem value="none">No translation</SelectItem>
-                                    <SelectItem value="en">English</SelectItem>
-                                    <SelectItem value="hi">Hindi</SelectItem>
-                                    <SelectItem value="kn">Kannada</SelectItem>
-                                    <SelectItem value="ta">Tamil</SelectItem>
-                                    <SelectItem value="es">Spanish</SelectItem>
-                                </SelectContent>
-                            </Select>
+                    <CardContent className="space-y-4 p-4">
+                        {/* Translation Status */}
+                        <div className="flex items-center gap-2">
+                            <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
+                            <span className="text-sm font-medium text-green-600">
+                                🎧 Listening for speech...
+                            </span>
                         </div>
 
-                        <div className={`p-2 rounded text-sm ${theme === 'dark' ? 'bg-gray-700' : 'bg-gray-100'}`}>
-                            <p className="text-xs text-gray-500 mb-1">Live speech ({detectedLanguage})</p>
-                            {transcript || "Start speaking..."}
+                        {/* Original Speech */}
+                        <div className={`p-3 rounded-lg ${theme === 'dark' ? 'bg-gray-700' : 'bg-gray-100'}`}>
+                            <div className="flex items-center gap-2 mb-2">
+                                <span className="text-xs font-semibold text-gray-500">ORIGINAL SPEECH</span>
+                                <Badge variant="outline" className="text-xs">
+                                    {detectedLanguage.toUpperCase()}
+                                </Badge>
+                            </div>
+                            <p className="text-sm">
+                                {transcript || "🎤 Start speaking..."}
+                            </p>
                         </div>
 
-                        <div className={`p-2 rounded text-sm ${theme === 'dark' ? 'bg-blue-900/30' : 'bg-blue-100'}`}>
-                            <p className="text-xs text-gray-500 mb-1">Translated</p>
-                            {translated || "..."}
+                        {/* Translated Text */}
+                        <div className={`p-3 rounded-lg bg-gradient-to-r from-blue-50 to-purple-50 border border-blue-200`}>
+                            <div className="flex items-center gap-2 mb-2">
+                                <span className="text-xs font-semibold text-blue-600">TRANSLATED</span>
+                                <Badge variant="secondary" className="text-xs bg-blue-100 text-blue-800">
+                                    {language?.toUpperCase()}
+                                </Badge>
+                            </div>
+                            <p className="text-sm font-medium text-blue-800">
+                                {translated || "⏳ Waiting for translation..."}
+                            </p>
+                        </div>
+
+                        {/* Quick Actions */}
+                        <div className="flex gap-2">
+                            <Button size="sm" variant="outline" className="flex-1">
+                                🔊 Speak Translation
+                            </Button>
+                            <Button size="sm" variant="outline" className="flex-1">
+                                📋 Copy Translation
+                            </Button>
                         </div>
                     </CardContent>
                 </Card>
