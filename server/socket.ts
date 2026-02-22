@@ -21,7 +21,13 @@ export function initSocket(server: any) {
 
             if (!rooms[roomId]) rooms[roomId] = [];
 
-            const user = { id: socket.id, name };
+            // Remove any existing user with same socket ID (prevent duplicates)
+            rooms[roomId] = rooms[roomId].filter(u => u.id !== socket.id);
+            
+            // Also remove any existing user with same name (prevent name duplicates)
+            rooms[roomId] = rooms[roomId].filter(u => u.name !== name || u.id === socket.id);
+            
+            const user = { id: socket.id, name: name || `User-${socket.id.slice(-4)}` };
             rooms[roomId].push(user);
 
             console.log("Users in room after join:", rooms[roomId]);
@@ -45,10 +51,50 @@ export function initSocket(server: any) {
         });
 
         // user leaves
-        socket.on("disconnect", () => {
-            for (const roomId in rooms) {
+        socket.on("leave-room", ({ roomId }) => {
+            console.log("=== USER LEAVING ROOM ===");
+            console.log("Socket ID:", socket.id);
+            console.log("Room ID:", roomId);
+            
+            socket.leave(roomId);
+            
+            if (rooms[roomId]) {
                 rooms[roomId] = rooms[roomId].filter((u) => u.id !== socket.id);
+                console.log("Users in room after leave:", rooms[roomId]);
                 io.to(roomId).emit("users", rooms[roomId]);
+            }
+        });
+
+        socket.on("disconnect", () => {
+            console.log("=== USER DISCONNECTED ===");
+            console.log("Socket ID:", socket.id);
+            
+            for (const roomId in rooms) {
+                // Remove user from room and update list
+                const originalLength = rooms[roomId].length;
+                rooms[roomId] = rooms[roomId].filter((u) => u.id !== socket.id);
+                
+                if (rooms[roomId].length < originalLength) {
+                    console.log(`Removed user ${socket.id} from room ${roomId}`);
+                    console.log("Users in room after disconnect:", rooms[roomId]);
+                    io.to(roomId).emit("users", rooms[roomId]);
+                }
+            }
+        });
+
+        // Additional cleanup on connection close
+        socket.on("close", () => {
+            console.log("=== SOCKET CLOSED ===");
+            console.log("Socket ID:", socket.id);
+            
+            for (const roomId in rooms) {
+                const originalLength = rooms[roomId].length;
+                rooms[roomId] = rooms[roomId].filter((u) => u.id !== socket.id);
+                
+                if (rooms[roomId].length < originalLength) {
+                    console.log(`Cleaned up user ${socket.id} from room ${roomId}`);
+                    io.to(roomId).emit("users", rooms[roomId]);
+                }
             }
         });
     });
